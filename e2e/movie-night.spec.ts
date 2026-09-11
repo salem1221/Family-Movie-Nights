@@ -1,0 +1,523 @@
+import { test, expect, type Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+
+// The About page prints the version vite compiled in, which comes from
+// package.json. Read from the same file rather than repeating the number
+// here, where a release bump would turn a green test red for no reason.
+const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+	version: string;
+};
+
+async function enterPin(page: Page) {
+	await page.goto('/');
+	await expect(page).toHaveURL(/\/pin$/);
+	await page.getByLabel('PIN').fill('2611');
+	await page.waitForURL((url) => url.pathname === '/');
+}
+
+async function choosePerson(page: Page, name: string) {
+	await page
+		.getByRole('button', { name: new RegExp(name) })
+		.first()
+		.click();
+	await expect(page.locator('header .who')).toContainText(name);
+}
+
+/** Add a movie by hand (the search would need a TMDB key). */
+async function addMovieByHand(page: Page, title: string) {
+	await page.goto('/propose');
+	await page.getByRole('button', { name: /Add manually/ }).click();
+	await page.getByPlaceholder('Title', { exact: true }).fill(title);
+	await page.getByRole('button', { name: 'Add', exact: true }).click();
+	await page.waitForURL(/\/movie\/\d+/);
+}
+
+/** Hand the shared phone to somebody else, mid-test. */
+async function switchPerson(page: Page, name: string) {
+	await page.locator('header .who').click();
+	await choosePerson(page, name);
+}
+
+/** Titles of the tiles in the order they appear in the DOM. */
+function tileOrder(page: Page): Promise<string[]> {
+	return page.locator('.tile .name').allInnerTexts();
+}
+
+test('a complete movie night: add, vote, evaluate, rate', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Anna');
+
+	await addMovieByHand(page, 'E2E-Test-Movie');
+	await expect(page.getByRole('heading', { name: /E2E-Test-Movie/ })).toBeVisible();
+
+	// Place a vote (starting balance 3) and see it again
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('Anna: 1')).toBeVisible();
+
+	// Evaluation with its confirmation modal
+	await page.goto('/evaluation');
+	await page.getByRole('button', { name: 'Reveal winner' }).click();
+	await page.getByRole('dialog').getByRole('button', { name: 'Reveal winner' }).click();
+	await expect(page.getByRole('heading', { name: /Tonight's movie is/ })).toBeVisible();
+
+	// While the winner is pending: no new evaluation is possible
+	await expect(page.getByText(/Confirm or undo this result first/)).toBeVisible();
+
+	await page.getByRole('button', { name: 'Mark as watched' }).click();
+	await page.getByRole('dialog').getByRole('button', { name: 'Mark as watched' }).click();
+	// Confirming lands on the archive by itself, with the film as the top card.
+	await page.waitForURL(/\/archive$/);
+	await expect(page.getByRole('button', { name: 'Mark as watched' })).toHaveCount(0);
+	await expect(page.locator('.entry').first()).toContainText('E2E-Test-Movie');
+
+	// Rating with half stars. The number is written in the notation of the active
+	// language, so with a dot in English.
+	await page.getByRole('button', { name: '4.5 stars' }).click();
+	await expect(page.getByText('Average: 4.5')).toBeVisible();
+});
+
+test('the vote balance falls and rises when placing and taking back', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Ben');
+
+	await addMovieByHand(page, 'Second Movie');
+
+	// 3 → 2 → 3 free votes in the header
+	await expect(page.locator('header .tokens')).toContainText('3');
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.locator('header .tokens')).toContainText('2');
+	await page.getByRole('button', { name: /Remove vote/ }).click();
+	await expect(page.locator('header .tokens')).toContainText('3');
+});
+
+test('the TV view shows the standings without the app frame', async ({ page, browserName }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Carla');
+
+	// This test adds both movies itself, otherwise the claim below would be
+	// worthless as soon as somebody changed the order of the tests.
+	await addMovieByHand(page, 'TV-Leftover'); // stays without votes
+	await addMovieByHand(page, 'TV-Favourite');
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('Carla: 1')).toBeVisible();
+
+	await page.goto('/tv');
+	await expect(page.getByText('Popcorn Vote', { exact: false }).first()).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Current standings' })).toBeVisible();
+	await expect(page.getByText('TV-Favourite')).toBeVisible();
+	// The movie without votes stays off the screen.
+	await expect(page.getByText('TV-Leftover')).toHaveCount(0);
+	// no app menu on the TV stage
+	await expect(page.locator('nav')).toHaveCount(0);
+
+	// The breakout button belongs to the installed app on Android only and must
+	// not appear in a plain browser context.
+	const fullscreenButton = page.getByRole('button', { name: 'Fullscreen', exact: true });
+	await expect(page.getByRole('button', { name: 'Open in the browser' })).toHaveCount(0);
+	if (browserName === 'chromium') {
+		await expect(fullscreenButton).toBeVisible();
+	} else {
+		// Headless WebKit's fullscreenEnabled is unverified territory, assert
+		// that the button follows the capability instead of assuming it exists.
+		const enabled = await page.evaluate(() => document.fullscreenEnabled);
+		await expect(fullscreenButton).toHaveCount(enabled ? 1 : 0);
+	}
+
+	if (browserName === 'chromium') {
+		await fullscreenButton.click();
+		const exitButton = page.getByRole('button', { name: 'Exit fullscreen' });
+		await expect(exitButton).toBeVisible();
+		// While fullscreen is on, Esc must not leave the stage.
+		await page.keyboard.press('Escape');
+		await expect(page).toHaveURL(/\/tv$/);
+		await exitButton.click();
+		await expect(fullscreenButton).toBeVisible();
+		// Leaving the stage tears TV mode down with it.
+		await fullscreenButton.click();
+		await expect(exitButton).toBeVisible();
+		await page.getByRole('button', { name: 'Close TV view' }).click();
+		await expect(page).toHaveURL(/\/$/);
+		// The teardown's exitFullscreen() is asynchronous, poll instead of racing it.
+		await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
+	}
+});
+
+test('a click beside the person picker closes it, and every balance is shown', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Anna');
+
+	const header = (await page.locator('header .tokens').innerText()).replace(/\D/g, '');
+	expect(Number(header)).toBeGreaterThan(0); // otherwise the comparison below is worthless
+
+	await page.locator('header .who').click();
+	const dialog = page.getByRole('dialog');
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByRole('button', { name: /Ben/ })).toBeVisible();
+	await expect(dialog.locator('.tokens')).toHaveCount(4);
+
+	// The value has to come from the server for real: Anna's balance in the dialog
+	// matches the one in the header. If the balance object arrived empty, this would
+	// read 0.
+	const inDialog = (
+		await dialog.locator('button', { hasText: 'Anna' }).locator('.tokens').innerText()
+	).replace(/\D/g, '');
+	expect(inDialog).toBe(header);
+
+	// A click in the top left corner lands beside the window and cancels.
+	await page.mouse.click(5, 5);
+	await expect(dialog).not.toBeVisible();
+});
+
+test('a click beside the confirmation does not evaluate', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'David');
+
+	await page.goto('/evaluation');
+	await page.getByRole('button', { name: 'Reveal winner' }).click();
+	await expect(page.getByRole('dialog').getByRole('button', { name: 'Reveal winner' })).toBeVisible();
+
+	await page.mouse.click(5, 5);
+	// The prompt is gone but nothing was evaluated: the button is still there.
+	await expect(page.getByRole('dialog').getByRole('button', { name: 'Reveal winner' })).toBeHidden();
+	await expect(page.getByRole('button', { name: 'Reveal winner' })).toBeVisible();
+});
+
+test('the list re-sorts only after a short quiet period', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Ben');
+
+	await addMovieByHand(page, 'ZZ-Latecomer');
+	await addMovieByHand(page, 'AA-Frontrunner');
+
+	await page.goto('/');
+	const before = await tileOrder(page);
+	expect(before.indexOf('AA-Frontrunner')).toBeLessThan(before.indexOf('ZZ-Latecomer'));
+
+	// A vote on the movie further back: it now belongs higher up straight away …
+	const tile = page.locator('.tile').filter({ hasText: 'ZZ-Latecomer' });
+	await tile.getByRole('button', { name: 'Put a vote on ZZ-Latecomer' }).click();
+	await expect(tile.locator('.mine')).toHaveText('1');
+
+	// … the data is there, but the order is deliberately still the old one.
+	const immediately = await tileOrder(page);
+	expect(immediately.indexOf('AA-Frontrunner')).toBeLessThan(immediately.indexOf('ZZ-Latecomer'));
+
+	// After the quiet period the tile moves up.
+	await expect
+		.poll(
+			async () => {
+				const now = await tileOrder(page);
+				return now.indexOf('ZZ-Latecomer') < now.indexOf('AA-Frontrunner');
+			},
+			{ timeout: 8000 }
+		)
+		.toBe(true);
+});
+
+test('the PIN can be typed on the keyboard, and ⌫ takes back one digit', async ({ page }) => {
+	await page.goto('/pin');
+	// The regular family login must never reveal its PIN. Only an instance
+	// explicitly started with demo content receives the small access note.
+	await expect(page.getByText('Demo access', { exact: true })).toHaveCount(0);
+	// Only once the script runs does anyone listen to the keyboard at all .
+	// otherwise the first keystrokes go nowhere. The click tests wait longer
+	// implicitly.
+	await page.waitForLoadState('networkidle');
+	const filled = page.locator('.pindot.filled');
+	await page.keyboard.type('261', { delay: 30 });
+	await expect(filled).toHaveCount(3);
+
+	// ⌫ takes back exactly one digit, not the whole entry.
+	await page.keyboard.press('Backspace');
+	await expect(filled).toHaveCount(2);
+
+	// After the fourth digit the app checks by itself.
+	await page.keyboard.type('11', { delay: 30 });
+	await page.waitForURL((url) => url.pathname === '/');
+});
+
+test('a suggestion can be attributed to another person', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'David');
+
+	await addMovieByHand(page, 'Added for Carla');
+
+	const proposer = page.getByLabel('Suggested by');
+	await expect(proposer).toHaveValue('david');
+	await proposer.selectOption('carla');
+	await page.reload();
+	await expect(page.getByLabel('Suggested by')).toHaveValue('carla');
+});
+
+test('authenticated API activity renews the server-enforced session', async ({ page }) => {
+	await enterPin(page);
+	const authCookie = async () =>
+		(await page.context().cookies()).find((cookie) => cookie.name === 'pv_auth')?.value ?? '';
+	const before = await authCookie();
+	expect(before).toMatch(/^legacy\./);
+
+	await page.waitForTimeout(1100);
+	await page.evaluate(async () => {
+		const response = await fetch('/api/person', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ personId: 'anna' })
+		});
+		if (!response.ok) throw new Error(`person request failed: ${response.status}`);
+	});
+	await expect.poll(authCookie).not.toBe(before);
+});
+
+// The switch itself, before signing in: whoever cannot read the lock screen has
+// to be able to change the language from exactly there.
+test('the language switcher on the PIN page changes the interface', async ({ page }) => {
+	await page.goto('/pin');
+	await expect(page.getByText('Enter your family PIN')).toBeVisible();
+	await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+
+	const languages = [
+		{ code: 'es', title: 'Introduce el PIN' },
+		{ code: 'fr', title: 'Saisir le code PIN' },
+		{ code: 'pt-BR', title: 'Digite o PIN' },
+		{ code: 'it', title: 'Inserisci il PIN' },
+		{ code: 'pl', title: 'Wpisz PIN' },
+		{ code: 'tr', title: "PIN'i gir" },
+		{ code: 'ja', title: 'PINを入力' },
+		{ code: 'de', title: 'PIN eingeben' }
+	];
+	for (const { code, title } of languages) {
+		await page.locator('.lang select').selectOption(code);
+		await expect(page).toHaveTitle(title);
+		// Not just the text: this is what a screen reader picks its voice from.
+		await expect(page.locator('html')).toHaveAttribute('lang', code);
+	}
+
+	// The choice applies to the device and survives a page change.
+	await page.reload();
+	await expect(page.getByText('Familien-PIN eingeben')).toBeVisible();
+
+	// Back to the instance setting, otherwise the next test would arrive here in
+	// German, and the choice would have no way back.
+	await page.getByLabel('Sprache').selectOption('');
+	await expect(page.getByText('Enter your family PIN')).toBeVisible();
+	await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+});
+
+test('the More page links to the project and carries its signature', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Anna');
+	await page.goto('/more');
+
+	const website = page.locator('a[href="https://popcornvote.org"]');
+	await expect(website).toContainText('Project website');
+	await expect(website).toHaveAttribute('target', '_blank');
+	await expect(website).toHaveAttribute('rel', 'noreferrer');
+
+	const repository = page.locator('a[href="https://github.com/Stadicus/popcorn-vote"]');
+	await expect(repository).toContainText('GitHub repository');
+	await expect(repository).toHaveAttribute('target', '_blank');
+	await expect(repository).toHaveAttribute('rel', 'noreferrer');
+
+	const creditNote = page.getByText('Get one new vote every Sunday at 8:00 AM, up to a balance of 5.', {
+		exact: true
+	});
+	await expect(creditNote).toBeVisible();
+	await expect(creditNote).toHaveCSS('text-align', 'center');
+
+	await expect(page.getByText('Made with ❤️ by Stadicus', { exact: true })).toBeVisible();
+	// Two assertions rather than one regex built from the version, which would
+	// mean escaping the version into a pattern. Together they are just as
+	// strict: the shape below only matches when the number starts right after
+	// "Version ", so the substring can only be the one package.json holds.
+	const printedVersion = page.locator('.version');
+	await expect(printedVersion).toHaveText(/^Version \d+\.\d+\.\d+\+[0-9a-f]{7}$/);
+	await expect(printedVersion).toContainText(`Version ${version}+`);
+});
+
+test('an unknown address lands on the error page', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Anna');
+
+	const response = await page.goto('/vorschlagen');
+	expect(response?.status()).toBe(404);
+	await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible();
+
+	await page.getByRole('link', { name: 'Back to movie list' }).click();
+	await page.waitForURL((url) => url.pathname === '/');
+
+	await page.context().addCookies([{ name: 'pv_lang', value: 'de', url: page.url() }]);
+	await page.goto('/archiv');
+	await expect(page.getByRole('heading', { name: 'Diese Seite gibt es nicht' })).toBeVisible();
+});
+
+test('TMDB search is configured while optional OMDb may stay unavailable', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'David');
+
+	await page.goto('/propose');
+	await expect(page.getByRole('searchbox')).toBeEnabled();
+	await addMovieByHand(page, 'Movie With Setup Key');
+	await expect(page.getByRole('heading', { name: /Movie With Setup Key/ })).toBeVisible();
+
+	// The OMDb key costs the IMDb rating and nothing else, so it stays small
+	// print under "More" instead of getting in the way of the game.
+	await page.goto('/more');
+	await expect(page.getByText('IMDb ratings are unavailable. TMDB ratings are shown instead.')).toBeVisible();
+	await expect(page.getByText('No OMDb key is configured.')).toBeVisible();
+});
+
+test('a movie night without Ben', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Anna');
+
+	// Two votes on Alpha so it leads the field outright once Ben's movies drop
+	// out: a tie would send the evening to the wheel and this test to chance.
+	await addMovieByHand(page, 'Night-Alpha');
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('Anna: 1')).toBeVisible();
+
+	await switchPerson(page, 'David');
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('David: 1')).toBeVisible();
+
+	await switchPerson(page, 'Ben');
+	await addMovieByHand(page, 'Night-Bravo');
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('Ben: 1')).toBeVisible();
+
+	await page.goto('/evaluation');
+	const bravo = page.locator('.board li', { hasText: 'Night-Bravo' });
+	await expect(bravo).toContainText('1 🍿');
+
+	// Ben is not here tonight, so his movie stops being a candidate and says so.
+	await page.getByRole('button', { name: /Someone missing/ }).click();
+	await page.locator('.picker').getByRole('button', { name: /Ben/ }).click();
+	await expect(bravo).toContainText('waits for Ben');
+	await expect(bravo).not.toContainText('🍿');
+
+	await page.getByRole('button', { name: 'Reveal winner' }).click();
+	const dialog = page.getByRole('dialog');
+	await expect(dialog.getByRole('heading', { name: 'Reveal the winner without Ben?' })).toBeVisible();
+	await dialog.getByRole('button', { name: 'Reveal winner' }).click();
+	await expect(page.getByRole('heading', { name: /Tonight's movie is/ })).toBeVisible();
+	await expect(page.locator('.winner')).toContainText('Night-Alpha');
+	await expect(page.locator('.winner')).toContainText('Without Ben');
+
+	await page.getByRole('button', { name: 'Mark as watched' }).click();
+	await page.getByRole('dialog').getByRole('button', { name: 'Mark as watched' }).click();
+	await page.waitForURL(/\/archive$/);
+	await expect(page.locator('.entry', { hasText: 'Night-Alpha' })).toContainText('Watched without Ben');
+
+	// Ben's movie kept its vote through all of it and is back to being a candidate.
+	// The evening ended with "watched", so the chips start empty again.
+	await page.goto('/evaluation');
+	await expect(page.locator('.board li', { hasText: 'Night-Bravo' })).toContainText('1 🍿');
+	await expect(page.getByRole('button', { name: /Someone missing/ })).toBeVisible();
+});
+
+test('a free pick without Ben', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Ben');
+
+	await addMovieByHand(page, 'Pick-Blocked');
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('Ben: 1')).toBeVisible();
+	const blocked = page.url();
+
+	await switchPerson(page, 'Anna');
+	await addMovieByHand(page, 'Pick-Free');
+	const free = page.url();
+
+	// A movie Ben voted for cannot be tonight's movie without him, and the dialog
+	// says so before anybody presses anything.
+	await page.goto(blocked);
+	await page.getByRole('button', { name: /Choose for tonight/ }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: /Someone missing/ }).click();
+	await dialog.locator('.picker').getByRole('button', { name: /Ben/ }).click();
+	await expect(dialog).toContainText('Ben voted for this movie');
+	await expect(dialog.getByRole('button', { name: 'Choose this movie' })).toBeDisabled();
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	await expect(dialog).toBeHidden();
+
+	// A movie nobody absent voted for goes through, and the evening is recorded
+	// as the one Ben missed.
+	await page.goto(free);
+	await page.getByRole('button', { name: /Choose for tonight/ }).click();
+	await dialog.getByRole('button', { name: /Someone missing/ }).click();
+	await dialog.locator('.picker').getByRole('button', { name: /Ben/ }).click();
+	await dialog.getByRole('button', { name: 'Choose this movie' }).click();
+	await page.waitForURL(/\/evaluation/);
+	await expect(page.locator('.winner')).toContainText('Pick-Free');
+	await expect(page.locator('.winner')).toContainText('Without Ben');
+
+	await page.getByRole('button', { name: 'Mark as watched' }).click();
+	await page.getByRole('dialog').getByRole('button', { name: 'Mark as watched' }).click();
+	await page.waitForURL(/\/archive$/);
+	await expect(page.locator('.entry', { hasText: 'Pick-Free' })).toContainText('Watched without Ben');
+});
+
+test('the evening is the same on the television and after a reload', async ({ page }) => {
+	await enterPin(page);
+	await choosePerson(page, 'Anna');
+
+	// Carla, not Ben: by this point in the file Ben has spent all three of his
+	// votes, and this test needs the absent person to actually hold one. The film
+	// titles deliberately carry no member's name — a tile button reading "Put a
+	// vote on Shared-Carla" matches the /Carla/ that picks a person, and
+	// `.first()` would then grab the tile instead of the dialog.
+	await addMovieByHand(page, 'Shared-One');
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('Anna: 1')).toBeVisible();
+
+	await switchPerson(page, 'Carla');
+	await addMovieByHand(page, 'Shared-Two');
+	const carlasFilm = page.url();
+	await page.getByRole('button', { name: /Add vote/ }).click();
+	await expect(page.getByText('Carla: 1')).toBeVisible();
+
+	await page.goto('/evaluation');
+	await page.getByRole('button', { name: /Someone missing/ }).click();
+	await page.locator('.picker').getByRole('button', { name: /Carla/ }).click();
+	const row = page.locator('.board li', { hasText: 'Shared-Two' });
+	await expect(row).toContainText('waits for Carla');
+
+	// The television is a different page with no idea what was tapped here; it
+	// learns it from the server or not at all.
+	await page.goto('/tv');
+	const tvRow = page.locator('.board li', { hasText: 'Shared-Two' });
+	await expect(tvRow).toContainText('waits for Carla');
+	await expect(tvRow).not.toContainText('🍿');
+
+	// A reload of the phone finds the same evening rather than a full count.
+	await page.goto('/evaluation');
+	await expect(page.locator('.board li', { hasText: 'Shared-Two' })).toContainText('waits for Carla');
+	await expect(page.getByRole('button', { name: /Everyone is here/ })).toBeVisible();
+
+	// The free-pick dialog is the evening's second entrance and reads the same
+	// state: it refuses Carla's film without anybody ticking her off again.
+	await page.goto(carlasFilm);
+	await page.getByRole('button', { name: /Choose for tonight/ }).click();
+	const dialog = page.getByRole('dialog');
+	await expect(dialog).toContainText('Carla voted for this movie');
+	await expect(dialog.getByRole('button', { name: 'Choose this movie' })).toBeDisabled();
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	await expect(dialog).toBeHidden();
+
+	// Tidy up, or the next test inherits an evening without Carla.
+	await page.goto('/evaluation');
+	await page.getByRole('button', { name: /Everyone is here/ }).click();
+	await expect(page.locator('.board li', { hasText: 'Shared-Two' })).toContainText('1 🍿');
+});
+
+// Has to go last: the failed attempts lock the IP for the following seconds.
+test('a wrong PIN leads to a rising wait', async ({ page }) => {
+	await page.goto('/pin');
+	for (let attempt = 0; attempt < 3; attempt++) {
+		for (const digit of ['9', '9', '9', '9']) {
+			await page.getByRole('button', { name: digit, exact: true }).click();
+		}
+		await page.waitForTimeout(300);
+	}
+	await expect(page.getByText(/Next attempt in \d+ seconds?/)).toBeVisible();
+});

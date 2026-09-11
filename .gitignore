@@ -1,0 +1,31 @@
+node_modules/
+.svelte-kit/
+build/
+dist/
+*.local
+.env
+.env.*
+# The template belongs in the repository, or the line above swallows it
+!.env.example
+data/
+# ...except the Umbrel package's bind-mount source. Umbrel expects the
+# directory to exist in the repository, and the rule above would drop it
+# without a word: git never descends into an ignored directory, so a fresh
+# clone would carry a package the store rejects.
+!packaging/umbrel/data/
+*.sqlite
+*.sqlite-*
+vite.config.ts.timestamp-*
+e2e/.data/
+playwright-report/
+test-results/
+coverage/
+
+# Working copies of the review subagents (isolation: worktree)
+.claude/worktrees/
+# Scratch state of the local review tooling, per session and per commit. Not
+# ignoring it meant a `git add -A` here swept up another session's markers.
+.claude/tmp/
+
+# Local security-review artefacts
+CLAUDE-SECURITY-*/

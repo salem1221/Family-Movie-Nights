@@ -1,0 +1,32 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: popcorn-vote_main_1
+      APP_PORT: 3000
+      # Umbrel auth is off for this app on purpose, and the reasoning is the
+      # opposite of the usual one: it is not that the app's own login would
+      # break, it is who the app is for. Popcorn Vote is used by the whole
+      # family from their own phones and tablets, while the Umbrel login belongs
+      # to whoever runs the server. Leaving Umbrel auth in front would mean
+      # handing the server password to the children in order to let them vote on
+      # a film, which is a far worse trade than the four-digit family PIN the
+      # app asks for and rate-limits per address.
+      PROXY_AUTH_ADD: "false"
+
+  main:
+    image: ghcr.io/stadicus/popcorn-vote:1.4.0@sha256:eb9e21d87780a45900bebaff5ea887d6d585bcb91e52aff96b79be3bb7d2b7c6
+    # umbreld clones the app store with `chown -R 1000:1000` and copies the
+    # package into app-data with `rsync --archive`, so the committed `data/`
+    # directory arrives owned by 1000:1000 (umbrel:umbrel). That is the image's
+    # own `node` user; stated explicitly so a future base-image change cannot
+    # silently move it and leave the data directory unwritable. Starting as root
+    # is neither needed here nor welcome in App Store review.
+    user: "1000:1000"
+    restart: on-failure
+    stop_grace_period: 1m
+    volumes:
+      # Everything worth keeping: the SQLite database, downloaded posters and
+      # the nightly backups. Nothing else in the container survives an update.
+      - ${APP_DATA_DIR}/data:/data
